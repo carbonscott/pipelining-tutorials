@@ -223,9 +223,174 @@ CONFIG = {
 - Increase `batch_size` or `input_shape` for more I/O (memory transfers)
 - Balance to match your real workload characteristics
 
+## Output Handling and Metadata Tracking
+
+A critical production pattern: tracking which data is in which buffer and safely retrieving results.
+
+### The Problem
+
+With N-way buffering, multiple batches are "in flight" simultaneously:
+- Buffer 0: Processing batch i+2 (H2D in progress)
+- Buffer 1: Processing batch i+1 (Compute in progress)
+- Buffer 2: Just finished batch i (D2H complete, ready to read)
+
+**Challenge**: How do you know which batch is in which buffer? How do you safely retrieve results without corrupting ongoing GPU work?
+
+### The Solution: Metadata Circular Buffer
+
+Use a metadata buffer (same size as GPU buffers) to track what's where:
+
+```python
+# Allocate metadata buffer (matches number of GPU buffers)
+self.metadata_buffers = [None] * num_buffers
+
+# AFTER scheduling GPU work, store metadata
+buffer_idx = pipeline.process_batch(...)
+pipeline.metadata_buffers[buffer_idx] = {
+    'batch_idx': batch_idx,
+    'batch_size': actual_batch_size,
+    'custom_data': your_metadata,
+}
+
+# BEFORE reading output, find which buffer is ready
+if batch_idx >= num_buffers - 1:
+    # Calculate buffer index for (N-1)-old batch
+    output_idx = (current_idx - (num_buffers - 1)) % num_buffers
+
+    # Sync D2H for this specific buffer
+    pipeline.d2h_done_event[output_idx].synchronize()
+
+    # Clone output tensor (critical!)
+    output = pipeline.cpu_output_buffers[output_idx].clone()
+
+    # Retrieve associated metadata
+    output_meta_idx = (batch_idx - (num_buffers - 1)) % num_buffers
+    output_meta = pipeline.metadata_buffers[output_meta_idx]
+
+    # Now safe to use output
+    save_to_file(output, output_meta)
+```
+
+### Why Clone?
+
+**Critical**: Always clone output tensors:
+```python
+output = cpu_output_buffers[idx].clone()  # REQUIRED
+```
+
+Without `clone()`:
+- Your "output" variable points directly to the buffer memory
+- Buffer gets reused in N iterations
+- Your "output" reference gets overwritten unexpectedly
+- Results in silent data corruption
+
+With `clone()`:
+- Creates an independent copy in new memory
+- Original buffer can be safely reused
+- Your output remains intact
+
+### The (N-1) Pattern
+
+**Why read from (N-1) iterations ago?**
+
+Timeline for N=3 buffers:
+```
+Iteration 0: Process batch 0 in buffer 0
+Iteration 1: Process batch 1 in buffer 1
+Iteration 2: Process batch 2 in buffer 2, READ batch 0 (from buffer 0)
+Iteration 3: Process batch 3 in buffer 0, READ batch 1 (from buffer 1)
+Iteration 4: Process batch 4 in buffer 1, READ batch 2 (from buffer 2)
+```
+
+Formula: `output_idx = (current_idx - (N - 1)) % N`
+
+**Why (N-1)?** With N buffers in flight:
+- Current buffer: H2D starting/in progress
+- (N-2) older buffers: Various stages of H2D/Compute/D2H
+- (N-1) oldest buffer: D2H complete, safe to read
+
+### Which Files Demonstrate This?
+
+All files with actual workloads now include metadata tracking:
+
+- **File 02** (`02_double_buffering.py`): Basic pattern with N=2
+  - Simple case: other buffer = `1 - current_idx`
+  - Shows metadata storage and output collection
+  - Demonstrates clone() necessity
+
+- **File 05** (`05_nway_advanced.py`): Generalized pattern for any N
+  - Uses `get_result_buffer_idx()` helper method
+  - Handles remaining (N-1) batches after main loop
+  - Shows complete output collection
+
+- **File 06** (`06_ray_nway_pipeline.py`): Full production pattern
+  - Complete pattern with Ray + N-way buffering
+  - NVTX annotations for profiling
+  - Detailed comments explaining timeline
+  - Production-ready implementation
+
+### Common Pitfalls
+
+**❌ Forgetting to clone**:
+```python
+output = pipeline.cpu_output_buffers[idx]  # WRONG - no clone()
+results.append(output)  # All results will show the same data!
+```
+
+**✓ Correct approach**:
+```python
+output = pipeline.cpu_output_buffers[idx].clone()  # RIGHT
+results.append(output)  # Each result is independent
+```
+
+**❌ Wrong metadata index**:
+```python
+# Wrong: using buffer_idx for old batch
+output_meta = metadata_buffers[output_idx]  # Might be wrong batch!
+```
+
+**✓ Correct approach**:
+```python
+# Right: calculate metadata index based on batch number
+output_meta_idx = (batch_idx - (num_buffers - 1)) % num_buffers
+output_meta = metadata_buffers[output_meta_idx]
+```
+
+**❌ Not synchronizing**:
+```python
+# Wrong: reading without sync
+output = pipeline.cpu_output_buffers[idx].clone()  # Might be incomplete!
+```
+
+**✓ Correct approach**:
+```python
+# Right: sync D2H event first
+pipeline.d2h_done_event[idx].synchronize()
+output = pipeline.cpu_output_buffers[idx].clone()  # Now safe
+```
+
+### Pattern Summary
+
+The complete pattern in order:
+1. **Schedule GPU work**: `buffer_idx = pipeline.process_batch(...)`
+2. **Store metadata**: `metadata_buffers[buffer_idx] = {...}`
+3. **Check if output ready**: `if batch_idx >= num_buffers - 1:`
+4. **Calculate output buffer**: `output_idx = (current_idx - (N-1)) % N`
+5. **Calculate metadata index**: `meta_idx = (batch_idx - (N-1)) % N`
+6. **Synchronize**: `d2h_done_event[output_idx].synchronize()`
+7. **Clone output**: `output = cpu_output_buffers[output_idx].clone()`
+8. **Retrieve metadata**: `meta = metadata_buffers[meta_idx]`
+9. **Use result**: `process_output(output, meta)`
+
+This pattern matches the production PeakNet pipeline implementation.
+
 ## Profiling with NVIDIA Nsight Systems
 
-### Basic Workflow
+Profiling differs between standalone GPU files and Ray-based files.
+
+### Standalone Files (01, 02, 05)
+
+These files run directly without Ray, so use standard nsys profiling:
 
 1. **Run with profiling**:
    ```bash
@@ -236,6 +401,63 @@ CONFIG = {
    ```bash
    nsight-sys output.nsys-rep  # GUI
    ```
+
+**Example**:
+```bash
+nsys profile -o baseline.nsys-rep --trace=cuda,nvtx python 01_sequential_baseline.py
+nsys profile -o double.nsys-rep --trace=cuda,nvtx python 02_double_buffering.py
+nsight-sys baseline.nsys-rep double.nsys-rep  # Compare both
+```
+
+### Ray Files (04, 06) - Different Approach!
+
+**IMPORTANT**: Ray spawns worker processes for actors, so profiling works differently.
+
+**DO NOT** use command-line nsys for Ray files:
+```bash
+# WRONG - only profiles the driver, not GPU workers!
+nsys profile python 04_ray_gpu_double_buffer.py
+```
+
+**CORRECT** approach - use `runtime_env` configuration:
+
+1. **Enable profiling in CONFIG**:
+   ```python
+   CONFIG = {
+       'enable_profiling': True,  # Enables runtime_env profiling
+       ...
+   }
+   ```
+
+2. **Run normally** (no nsys wrapper):
+   ```bash
+   python 04_ray_gpu_double_buffer.py
+   ```
+
+3. **Profiling files auto-generated**:
+   ```bash
+   # Ray creates .nsys-rep files per worker
+   ls /tmp/ray/session_*/logs/nsight/*.nsys-rep
+   ```
+
+4. **View results**:
+   ```bash
+   nsys-ui /tmp/ray/session_latest/logs/nsight/*.nsys-rep
+   ```
+
+**How it works**:
+- Ray actors use `runtime_env={"nsight": {...}}` decorator
+- Ray automatically wraps each worker process with nsys
+- Each GPU actor gets its own profiling file
+- NVTX annotations include actor IDs (Worker0/, Worker1/)
+
+**Comparison Table**:
+
+| File Type | Profiling Method | Command |
+|-----------|------------------|---------|
+| 01-02, 05 (standalone) | Command-line nsys | `nsys profile python file.py` |
+| 03 (Ray CPU-only) | No profiling needed | N/A |
+| 04, 06 (Ray + GPU) | `runtime_env` config | Set `enable_profiling=True` in CONFIG |
 
 ### What to Look For
 

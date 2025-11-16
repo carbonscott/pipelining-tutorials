@@ -138,6 +138,10 @@ class NWayBufferedPipeline:
             self.compute_done_event[i].record(torch.cuda.current_stream())
             self.d2h_done_event[i].record(torch.cuda.current_stream())
 
+        # Metadata tracking (matches number of buffers)
+        # Stores information about which batch is in which buffer
+        self.metadata_buffers = [None] * num_buffers
+
         # Track current buffer
         self.current_idx = 0
 
@@ -160,6 +164,9 @@ class NWayBufferedPipeline:
         Process a batch through H2D -> Compute -> D2H pipeline.
 
         Same interface as DoubleBufferedPipeline for consistency.
+
+        Returns:
+            buffer_idx: Index of buffer used for this batch (for metadata tracking)
         """
         buffer_idx = self.current_idx
 
@@ -167,6 +174,8 @@ class NWayBufferedPipeline:
             self._h2d_transfer(cpu_batch, buffer_idx, current_batch_size)
             self._compute_workload(buffer_idx, current_batch_size)
             self._d2h_transfer(buffer_idx, current_batch_size)
+
+        return buffer_idx
 
     def _h2d_transfer(self, cpu_batch, buffer_idx, current_batch_size):
         with nvtx.range(f"H2D[buf={buffer_idx}]"):
@@ -276,6 +285,9 @@ def nway_pipeline(config):
     print("Starting N-way buffered processing...")
     start_time = time.time()
 
+    # Track collected outputs for demonstration
+    collected_outputs = []
+
     with nvtx.range(f"{num_buffers}-Way Buffered Processing"):
         for batch_idx in range(num_batches):
             # Simulate CPU preprocessing
@@ -288,18 +300,58 @@ def nway_pipeline(config):
                 pipeline.swap()
 
             # Schedule async GPU work
-            pipeline.process_batch(cpu_input, batch_idx, batch_size)
+            buffer_idx = pipeline.process_batch(cpu_input, batch_idx, batch_size)
 
+            # Store metadata AFTER process_batch, BEFORE reading output
+            pipeline.metadata_buffers[buffer_idx] = {
+                'batch_idx': batch_idx,
+                'batch_size': batch_size,
+            }
+
+            # Handle output from (N-1) iterations ago
             # For N>=3, we can safely read older results while GPU works
             if batch_idx >= num_buffers - 1:
+                # Calculate which buffer to read (N-1 iterations old)
                 result_idx = pipeline.get_result_buffer_idx(batch_idx)
+
+                # Calculate metadata index for the batch we're reading
+                # This is (N-1) batches earlier than current
+                output_meta_idx = (batch_idx - (num_buffers - 1)) % num_buffers
+
                 # Sync only the specific buffer we need
                 pipeline.d2h_done_event[result_idx].synchronize()
-                # Now safe to read cpu_output_buffers[result_idx]
-                # (In production, you'd do something with the result here)
+
+                # CRITICAL: Clone output tensor (prevents async overwrites!)
+                # WHY CLONE? This buffer will be reused in N iterations.
+                # Without clone(), your "output" reference points to memory
+                # that gets overwritten when this buffer cycles back around.
+                output = pipeline.cpu_output_buffers[result_idx].clone()
+
+                # Retrieve associated metadata
+                output_meta = pipeline.metadata_buffers[output_meta_idx]
+
+                # Now safe to use output (save to file, send to queue, etc.)
+                collected_outputs.append({'metadata': output_meta, 'output': output})
+
+                if batch_idx % 10 == 0:
+                    print(f"  Collected output for batch {output_meta['batch_idx']}")
 
     # Wait for all work to complete
     pipeline.wait_for_completion()
+
+    # Collect remaining (N-1) batches that are still in flight
+    for i in range(1, num_buffers):
+        remaining_batch_idx = num_batches - i
+        if remaining_batch_idx >= 0:
+            result_idx = (pipeline.current_idx - i) % num_buffers
+            output_meta_idx = remaining_batch_idx % num_buffers
+
+            pipeline.d2h_done_event[result_idx].synchronize()
+            output = pipeline.cpu_output_buffers[result_idx].clone()
+            output_meta = pipeline.metadata_buffers[output_meta_idx]
+
+            collected_outputs.append({'metadata': output_meta, 'output': output})
+            print(f"  Collected remaining output for batch {output_meta['batch_idx']}")
 
     end_time = time.time()
     elapsed = end_time - start_time
@@ -309,6 +361,7 @@ def nway_pipeline(config):
     print(f"  Total time: {elapsed:.3f} seconds")
     print(f"  Throughput: {throughput:.1f} samples/second")
     print(f"  Time per batch: {elapsed/num_batches*1000:.2f} ms")
+    print(f"  Outputs collected: {len(collected_outputs)}/{num_batches}")
     print()
     print(f"ANALYSIS WITH N={num_buffers}:")
     if num_buffers == 2:

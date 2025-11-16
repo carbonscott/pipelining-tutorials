@@ -13,10 +13,19 @@ LEARNING GOALS:
 
 WHAT TO OBSERVE:
 - Run with: python 06_ray_nway_pipeline.py
-- Profile with: nsys profile -o ray_nway.nsys-rep --trace=cuda,nvtx python 06_ray_nway_pipeline.py
-- Ray dashboard: GPU utilization, actor status, object store usage
-- nsys timeline: N actors × M buffers = N×M concurrent operations
-- Compare: Vary num_gpu_actors and num_buffers_per_actor to see scaling
+- Ray dashboard: http://127.0.0.1:8265 (GPU utilization, actor status, object store usage)
+- Experiment: Vary num_gpu_actors and num_buffers_per_actor to see scaling
+
+PROFILING (Ray-specific approach):
+- Set enable_profiling=True in CONFIG dict below
+- Run: python 06_ray_nway_pipeline.py
+- Profiling files auto-generated in: /tmp/ray/session_*/logs/nsight/*.nsys-rep
+- View with: nsys-ui /tmp/ray/session_latest/logs/nsight/*.nsys-rep
+- Timeline shows: N actors × M buffers = N×M concurrent operations
+
+IMPORTANT: DO NOT use "nsys profile python 06_ray_nway_pipeline.py"
+That only profiles the driver process, not the GPU worker actors!
+Ray profiling uses runtime_env configuration (see actor decorators below).
 
 CONFIGURATION:
 Edit CONFIG dict below
@@ -53,6 +62,7 @@ CONFIG = {
     'pin_memory': True,
     'queue_size': 20,
     'cpu_delay_ms': 0,  # Simulated CPU preprocessing (0 = none)
+    'enable_profiling': False,  # Set to True for nsys profiling via Ray runtime_env
 }
 
 
@@ -161,10 +171,9 @@ class NWayBufferedPipeline:
         self.d2h_stream.synchronize()
 
 
-@ray.remote(num_gpus=1)
-class NWayGPUWorkerActor:
+class NWayGPUWorkerActorBase:
     """
-    GPU worker actor with configurable N-way buffering.
+    Base class for GPU worker actor with configurable N-way buffering.
 
     Production-ready: Supports any N >= 2.
     """
@@ -185,6 +194,9 @@ class NWayGPUWorkerActor:
             batch_size, input_shape, num_iterations, num_buffers,
             gpu_id=0, pin_memory=pin_memory
         )
+
+        # Metadata tracking (matches num_buffers)
+        self.metadata_buffers = [None] * num_buffers
 
         self.processed_count = 0
 
@@ -219,15 +231,54 @@ class NWayGPUWorkerActor:
                 if self.processed_count > 0:
                     self.pipeline.swap()
 
-                # Process with N-way buffering
-                self.pipeline.process_batch(
+                # Process through pipeline - schedules async H2D/Compute/D2H
+                buffer_idx = self.pipeline.process_batch(
                     cpu_batch, batch_idx, self.batch_size, nvtx_prefix
                 )
 
-                self.processed_count += 1
+                # CRITICAL PATTERN: Store metadata AFTER process_batch, BEFORE reading output
+                # Timeline for N=3:
+                #   Iteration 0: Store meta[0], process batch 0
+                #   Iteration 1: Store meta[1], process batch 1
+                #   Iteration 2: Store meta[2], process batch 2, READ output[0]
+                #   Iteration 3: Store meta[0], process batch 3, READ output[1]
+                #
+                # Why (N-1)? With N buffers in flight:
+                #   - Current buffer (idx=0): H2D happening now
+                #   - Next buffer (idx=1): Compute happening now
+                #   - Previous buffer (idx=2): D2H just finished, safe to read
 
-                if self.processed_count % 20 == 0:
-                    print(f"[Worker {self.actor_id}] Processed {self.processed_count} batches")
+                self.metadata_buffers[buffer_idx] = {
+                    'batch_idx': batch_idx,
+                    'batch_size': self.batch_size,
+                    'timestamp': time.time(),
+                }
+
+                # Handle output from (N-1) iterations ago
+                # Only start after pipeline has filled (processed >= N-1 batches)
+                if self.processed_count >= self.num_buffers - 1:
+                    # Calculate which buffer to read from (N-1 iterations old)
+                    output_idx = (self.pipeline.current_idx - (self.num_buffers - 1)) % self.num_buffers
+
+                    # Retrieve metadata for the batch we're outputting
+                    output_meta_idx = (self.processed_count - (self.num_buffers - 1)) % self.num_buffers
+                    output_meta = self.metadata_buffers[output_meta_idx]
+
+                    # CRITICAL: Synchronize on D2H event for this specific buffer
+                    # With N>=3, this completes instantly (D2H finished long ago)
+                    with nvtx.range(f"{nvtx_prefix}SyncD2H[buf={output_idx}]"):
+                        self.pipeline.d2h_done_event[output_idx].synchronize()
+
+                    # Clone output (critical for async safety!)
+                    with nvtx.range(f"{nvtx_prefix}CloneOutput"):
+                        output = self.pipeline.cpu_output_buffers[output_idx][:output_meta['batch_size']].clone()
+
+                    # Package and send to next stage (CPU-bound work, overlaps with GPU)
+                    # In production: output_queue.put(...), save to file, etc.
+                    if self.processed_count % 20 == 0:
+                        print(f"[Worker {self.actor_id}] Collected batch {output_meta['batch_idx']}, shape: {output.shape}")
+
+                self.processed_count += 1
 
             except Exception as e:
                 print(f"[Worker {self.actor_id}] Error: {e}")
@@ -238,6 +289,30 @@ class NWayGPUWorkerActor:
 
         print(f"[Worker {self.actor_id}] Finished. Total processed: {self.processed_count}")
         return self.processed_count
+
+
+@ray.remote(num_gpus=1)
+class NWayGPUWorkerActor(NWayGPUWorkerActorBase):
+    """Standard N-way GPU worker actor without profiling."""
+    pass
+
+
+@ray.remote(num_gpus=1, runtime_env={"nsight": {
+    "t": "cuda,nvtx",
+    "cuda-memory-usage": "true",
+}})
+class NWayGPUWorkerActorWithProfiling(NWayGPUWorkerActorBase):
+    """
+    N-way GPU worker actor with nsys profiling enabled.
+
+    Ray automatically wraps this actor's worker process with nsys profiling.
+    Profiling files are generated in: /tmp/ray/session_*/logs/nsight/*.nsys-rep
+
+    Runtime environment configuration:
+    - "t": "cuda,nvtx" - Trace CUDA kernels and NVTX annotations
+    - "cuda-memory-usage": "true" - Track memory allocations
+    """
+    pass
 
 
 @ray.remote
@@ -286,6 +361,7 @@ def ray_nway_pipeline(config):
     pin_memory = config['pin_memory']
     queue_size = config['queue_size']
     cpu_delay_ms = config['cpu_delay_ms']
+    enable_profiling = config.get('enable_profiling', False)
 
     # Initialize Ray
     if not ray.is_initialized():
@@ -320,6 +396,9 @@ def ray_nway_pipeline(config):
           f"{num_gpu_actors * num_buffers_per_actor} concurrent batches")
     print(f"  CPU preprocessing delay: {cpu_delay_ms} ms")
     print(f"  Pinned memory: {pin_memory}")
+    print(f"  Profiling: {'ENABLED' if enable_profiling else 'DISABLED'}")
+    if enable_profiling:
+        print(f"  Profile location: /tmp/ray/session_latest/logs/nsight/")
     print()
 
     num_batches = total_samples // batch_size
@@ -330,15 +409,19 @@ def ray_nway_pipeline(config):
     # Create producer
     producer = DataProducer.remote(batch_size, input_shape)
 
+    # Select actor class based on profiling preference
+    ActorClass = NWayGPUWorkerActorWithProfiling if enable_profiling else NWayGPUWorkerActor
+
     # Create N-way GPU worker actors
     workers = [
-        NWayGPUWorkerActor.remote(
+        ActorClass.remote(
             i, batch_size, input_shape, num_iterations, num_buffers_per_actor, pin_memory
         )
         for i in range(num_gpu_actors)
     ]
 
-    print(f"Created {num_gpu_actors} GPU worker actors with {num_buffers_per_actor}-way buffering")
+    profiling_status = "WITH profiling" if enable_profiling else "WITHOUT profiling"
+    print(f"Created {num_gpu_actors} GPU worker actors with {num_buffers_per_actor}-way buffering {profiling_status}")
     print()
 
     start_time = time.time()
@@ -379,8 +462,19 @@ def ray_nway_pipeline(config):
     print(f"  ✓ NVTX profiling: Worker{id}/Batch{n}[buf={b}]")
     print(f"  ✓ Total concurrency: {num_gpu_actors * num_buffers_per_actor} batches in flight")
     print()
+    print("RAY PROFILING APPROACH:")
+    print("  - Ray uses runtime_env to wrap worker processes with nsys")
+    print("  - Set enable_profiling=True in CONFIG to enable")
+    print("  - Profiling files appear in /tmp/ray/session_*/logs/nsight/")
+    print("  - View with: nsys-ui /tmp/ray/session_latest/logs/nsight/*.nsys-rep")
+    print("  - Filter by 'Worker0/', 'Worker1/' to see per-GPU pipeline behavior")
+    if enable_profiling:
+        print()
+        print(f"  ✓ Profiling was ENABLED for this run")
+        print(f"  ✓ Check: /tmp/ray/session_latest/logs/nsight/")
+    print()
     print("TUNING RECOMMENDATIONS:")
-    print("  1. Profile with nsys to identify bottlenecks")
+    print("  1. Enable profiling (enable_profiling=True) to identify bottlenecks")
     print("  2. If GPU utilization < 80%: Check queue_size, increase if needed")
     print("  3. If CPU busy: Increase num_buffers_per_actor to 3")
     print("  4. If I/O bound: Add more producers or optimize data loading")

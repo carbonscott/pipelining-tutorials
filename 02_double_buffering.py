@@ -115,6 +115,10 @@ class DoubleBufferedPipeline:
             self.compute_done_event[i].record(torch.cuda.current_stream())
             self.d2h_done_event[i].record(torch.cuda.current_stream())
 
+        # Metadata tracking (matches number of buffers)
+        # Stores information about which batch is in which buffer
+        self.metadata_buffers = [None] * 2
+
         # Track current buffer
         self.current_idx = 0
 
@@ -134,6 +138,9 @@ class DoubleBufferedPipeline:
             batch_idx: Sequential batch number (for profiling/logging)
             current_batch_size: Actual size of this batch (handles partial batches)
             nvtx_prefix: String prefix for NVTX annotations
+
+        Returns:
+            buffer_idx: Index of buffer used for this batch (for metadata tracking)
         """
         buffer_idx = self.current_idx
 
@@ -144,6 +151,8 @@ class DoubleBufferedPipeline:
             self._h2d_transfer(cpu_batch, buffer_idx, current_batch_size)
             self._compute_workload(buffer_idx, current_batch_size)
             self._d2h_transfer(buffer_idx, current_batch_size)
+
+        return buffer_idx
 
     def _h2d_transfer(self, cpu_batch, buffer_idx, current_batch_size):
         """Host to Device transfer"""
@@ -228,16 +237,57 @@ def double_buffered_pipeline(config):
     print("Starting double-buffered processing...")
     start_time = time.time()
 
+    # Track collected outputs for demonstration
+    collected_outputs = []
+
     with nvtx.range("Double-Buffered Processing"):
         for batch_idx in range(num_batches):
             if batch_idx > 0:
                 pipeline.swap()  # Alternate buffers
 
             # Schedule async work (returns immediately!)
-            pipeline.process_batch(cpu_input, batch_idx, batch_size)
+            buffer_idx = pipeline.process_batch(cpu_input, batch_idx, batch_size)
+
+            # Store metadata for this batch
+            # This allows us to track which batch is in which buffer
+            pipeline.metadata_buffers[buffer_idx] = {
+                'batch_idx': batch_idx,
+                'batch_size': batch_size,
+            }
+
+            # Collect output from previous iteration
+            # For double buffering (N=2), we can read output after 1 iteration (N-1=1)
+            if batch_idx >= 1:
+                # Which buffer has the previous batch? The other one!
+                output_idx = 1 - buffer_idx  # Simple for N=2
+
+                # CRITICAL: Synchronize D2H for this specific buffer
+                pipeline.d2h_done_event[output_idx].synchronize()
+
+                # CRITICAL: Clone output to safely use it
+                # Without clone(), the buffer will be overwritten in next iteration
+                output = pipeline.cpu_output_buffers[output_idx].clone()
+
+                # Retrieve associated metadata
+                output_meta = pipeline.metadata_buffers[output_idx]
+
+                # Now safe to use output (save to file, send to queue, etc.)
+                collected_outputs.append({'metadata': output_meta, 'output': output})
+
+                if batch_idx % 10 == 0:
+                    print(f"  Collected output for batch {output_meta['batch_idx']}")
 
     # Wait for all work to complete
     pipeline.wait_for_completion()
+
+    # Collect final batch output (the last one)
+    if num_batches > 0:
+        final_idx = pipeline.current_idx
+        pipeline.d2h_done_event[final_idx].synchronize()
+        output = pipeline.cpu_output_buffers[final_idx].clone()
+        output_meta = pipeline.metadata_buffers[final_idx]
+        collected_outputs.append({'metadata': output_meta, 'output': output})
+        print(f"  Collected final output for batch {output_meta['batch_idx']}")
 
     end_time = time.time()
     elapsed = end_time - start_time
@@ -247,9 +297,17 @@ def double_buffered_pipeline(config):
     print(f"  Total time: {elapsed:.3f} seconds")
     print(f"  Throughput: {throughput:.1f} samples/second")
     print(f"  Time per batch: {elapsed/num_batches*1000:.2f} ms")
+    print(f"  Outputs collected: {len(collected_outputs)}/{num_batches}")
     print()
     print("OBSERVATION: In nsys timeline, you'll see H2D, Compute, and D2H overlap!")
     print("The GPU is never idle - we've eliminated the gaps from file 01.")
+    print()
+    print("OUTPUT HANDLING PATTERN:")
+    print("  1. Store metadata AFTER process_batch() call")
+    print("  2. Read output from previous iteration (batch_idx >= 1)")
+    print("  3. Synchronize D2H event for specific buffer")
+    print("  4. Clone output tensor (critical for async safety!)")
+    print("  5. Use output (save, send to queue, etc.)")
     print()
     print("NVTX PLACEMENT LESSON:")
     print("  - Annotate each stage (H2D/Compute/D2H) with buffer index")
