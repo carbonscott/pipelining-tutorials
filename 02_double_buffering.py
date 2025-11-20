@@ -5,33 +5,21 @@
 PURPOSE:
 Eliminate GPU idle time by overlapping H2D, Compute, and D2H operations.
 
-LEARNING GOALS:
-- Understand the double-buffering pattern (2 buffers, 3 streams)
-- Implement process_batch() interface matching production code
-- Use CUDA events for fine-grained synchronization
-- Learn when/where to place NVTX annotations for profiling
-
-WHAT TO OBSERVE:
-- Run with: python 02_double_buffering.py
-- Profile with: nsys profile -o double.nsys-rep --trace=cuda,nvtx python 02_double_buffering.py
-- In nsys timeline: H2D, Compute, D2H overlap (no gaps!)
-- Compare with baseline: Open both baseline.nsys-rep and double.nsys-rep in nsys GUI
+PROFILING:
+nsys profile -o double.nsys-rep --trace=cuda,nvtx python 02_double_buffering.py
 
 CONFIGURATION:
-Edit CONFIG dict below (same parameters as file 01)
-
-NEXT: 03_ray_producer_consumer.py to learn Ray orchestration
+Edit CONFIG dict below.
 """
 
 import torch
 import torch.cuda.nvtx as nvtx
-import time
 
 # Configuration
 CONFIG = {
     'batch_size': 8,
     'num_batches': 40,
-    'input_shape': (1, 512, 512),  # (C, H, W)
+    'input_shape': (1, 128, 128),  # (C, H, W)
     'num_iterations': 10,  # Controls compute time
     'gpu_id': 0,
     'pin_memory': True,  # Use pinned CPU memory for faster async transfers
@@ -239,9 +227,6 @@ def double_buffered_pipeline(config):
         pipeline.process_batch(cpu_input, i, batch_size, "Warmup/")
     pipeline.wait_for_completion()
 
-    print("Starting double-buffered processing...")
-    start_time = time.time()
-
     # Track collected outputs for demonstration
     collected_outputs = []
 
@@ -294,30 +279,7 @@ def double_buffered_pipeline(config):
         collected_outputs.append({'metadata': output_meta, 'output': output})
         print(f"  Collected final output for batch {output_meta['batch_idx']}")
 
-    end_time = time.time()
-    elapsed = end_time - start_time
-    throughput = num_batches * batch_size / elapsed
-
-    print(f"\nResults:")
-    print(f"  Total time: {elapsed:.3f} seconds")
-    print(f"  Throughput: {throughput:.1f} samples/second")
-    print(f"  Time per batch: {elapsed/num_batches*1000:.2f} ms")
-    print(f"  Outputs collected: {len(collected_outputs)}/{num_batches}")
-    print()
-    print("OBSERVATION: In nsys timeline, you'll see H2D, Compute, and D2H overlap!")
-    print("The GPU is never idle - we've eliminated the gaps from file 01.")
-    print()
-    print("OUTPUT HANDLING PATTERN:")
-    print("  1. Store metadata AFTER process_batch() call")
-    print("  2. Read output from previous iteration (batch_idx >= 1)")
-    print("  3. Synchronize D2H event for specific buffer")
-    print("  4. Clone output tensor (critical for async safety!)")
-    print("  5. Use output (save, send to queue, etc.)")
-    print()
-    print("NVTX PLACEMENT LESSON:")
-    print("  - Annotate each stage (H2D/Compute/D2H) with buffer index")
-    print("  - This helps visualize which buffer is where in the pipeline")
-    print("  - In nsys, you can see Buffer 0 and Buffer 1 alternating through stages")
+    print(f"Processed {num_batches} batches, collected {len(collected_outputs)} outputs")
 
 
 if __name__ == '__main__':

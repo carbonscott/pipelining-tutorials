@@ -5,42 +5,21 @@
 PURPOSE:
 Learn when and how to use N>2 buffers for improved performance.
 
-LEARNING GOALS:
-- Understand generalized N-way buffering (N=2,3,4,...)
-- Implement circular buffer rotation
-- Learn when N>2 helps (CPU preprocessing, memory constraints)
-- Compare performance across different N values
-- Understand the tradeoff: more buffers = more memory, diminishing returns
-
-WHAT TO OBSERVE:
-- Run with: python 05_nway_advanced.py
-- Profile with: nsys profile -o nway.nsys-rep --trace=cuda,nvtx python 05_nway_advanced.py
-- In nsys timeline: See N buffers cycling through pipeline
-- Try different num_buffers values (2, 3, 4) and cpu_delay_ms (0, 5, 10)
-- Notice: N>2 helps when CPU has work to do during GPU processing
+PROFILING:
+nsys profile -o nway.nsys-rep --trace=cuda,nvtx python 05_nway_advanced.py
 
 CONFIGURATION:
-Edit CONFIG dict below
-- num_buffers: 2 (double), 3 (triple), 4 (quad), etc.
-- cpu_delay_ms: Simulates CPU preprocessing time
-
-WHEN TO USE N>2:
-- CPU preprocessing takes significant time
-- Memory permits (N buffers = N × memory per buffer)
-- GPU is bottleneck, not CPU or I/O
-
-NEXT: 06_ray_nway_pipeline.py to combine N-way with Ray orchestration
+Edit CONFIG dict below.
 """
 
 import torch
 import torch.cuda.nvtx as nvtx
-import time
 
 # Configuration
 CONFIG = {
     'batch_size': 8,
     'num_batches': 40,
-    'input_shape': (1, 512, 512),  # (C, H, W)
+    'input_shape': (1, 128, 128),  # (C, H, W)
     'num_iterations': 10,  # Matmul loop iterations
     'gpu_id': 0,
     'pin_memory': True,
@@ -287,9 +266,6 @@ def nway_pipeline(config):
         pipeline.process_batch(cpu_input, i, batch_size, "Warmup/")
     pipeline.wait_for_completion()
 
-    print("Starting N-way buffered processing...")
-    start_time = time.time()
-
     # Track collected outputs for demonstration
     collected_outputs = []
 
@@ -358,36 +334,7 @@ def nway_pipeline(config):
             collected_outputs.append({'metadata': output_meta, 'output': output})
             print(f"  Collected remaining output for batch {output_meta['batch_idx']}")
 
-    end_time = time.time()
-    elapsed = end_time - start_time
-    throughput = num_batches * batch_size / elapsed
-
-    print(f"\nResults:")
-    print(f"  Total time: {elapsed:.3f} seconds")
-    print(f"  Throughput: {throughput:.1f} samples/second")
-    print(f"  Time per batch: {elapsed/num_batches*1000:.2f} ms")
-    print(f"  Outputs collected: {len(collected_outputs)}/{num_batches}")
-    print()
-    print(f"ANALYSIS WITH N={num_buffers}:")
-    if num_buffers == 2:
-        print("  Double buffering: Good baseline for most cases")
-        print("  If CPU has work to do, try N=3")
-    elif num_buffers == 3:
-        print("  Triple buffering: Helps when CPU preprocessing takes time")
-        print("  Compare with N=2 - is throughput better?")
-    else:
-        print(f"  {num_buffers}-way buffering: Diminishing returns beyond N=3")
-        print("  More memory usage, likely no performance gain")
-    print()
-    print("WHEN TO USE N>2:")
-    print("  - CPU preprocessing delay > GPU compute time")
-    print("  - Memory is not a constraint")
-    print("  - Profile first, then increase N if needed")
-    print()
-    print("TRY THIS:")
-    print("  - Run with cpu_delay_ms=0: N=2 and N=3 should be similar")
-    print("  - Run with cpu_delay_ms=10: N=3 should be faster than N=2")
-    print("  - Profile both to see the difference in nsys timeline")
+    print(f"Processed {num_batches} batches with {num_buffers}-way buffering, collected {len(collected_outputs)} outputs")
 
 
 if __name__ == '__main__':
@@ -396,15 +343,3 @@ if __name__ == '__main__':
         exit(1)
 
     nway_pipeline(CONFIG)
-
-    # Optional: Compare different N values
-    print("\n" + "="*60)
-    print("OPTIONAL: Quick comparison of N=2 vs N=3")
-    print("="*60 + "\n")
-
-    for N in [2, 3]:
-        print(f"\n--- Testing with N={N} buffers ---")
-        test_config = CONFIG.copy()
-        test_config['num_buffers'] = N
-        test_config['num_batches'] = 20  # Shorter run for comparison
-        nway_pipeline(test_config)

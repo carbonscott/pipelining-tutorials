@@ -5,29 +5,13 @@
 PURPOSE:
 Learn Ray's object store and actor patterns without GPU complexity.
 
-LEARNING GOALS:
-- Understand Ray initialization and resource discovery
-- Create producer and consumer actors
-- Use Ray Queue for communication
-- Learn object store zero-copy pattern
-- Implement graceful shutdown
-
-WHAT TO OBSERVE:
-- Run with: python 03_ray_producer_consumer.py
-- Watch: Ray dashboard at http://127.0.0.1:8265
-- Notice: Actors running in parallel, object store memory usage
-- No profiling needed (CPU-only example)
-
 CONFIGURATION:
-Edit CONFIG dict below
-
-NEXT: 04_ray_gpu_double_buffer.py to combine Ray + GPU pipelining
+Edit CONFIG dict below.
 """
 
 import ray
 from ray.util.queue import Queue
 import numpy as np
-import time
 import signal
 import sys
 
@@ -200,9 +184,6 @@ def ray_producer_consumer_pipeline(config):
     consumers = [DataConsumer.remote(i) for i in range(num_consumers)]
 
     print(f"Created {num_consumers} consumer actors")
-    print()
-
-    start_time = time.time()
 
     # Start producer (async call)
     producer_task = producer.produce.remote(queue, num_batches)
@@ -223,25 +204,7 @@ def ray_producer_consumer_pipeline(config):
     processed_counts = ray.get(consumer_tasks)
     total_processed = sum(processed_counts)
 
-    end_time = time.time()
-    elapsed = end_time - start_time
-    throughput = total_processed * batch_size / elapsed
-
-    print(f"\n{'='*60}")
-    print("Results:")
-    print(f"  Total time: {elapsed:.3f} seconds")
-    print(f"  Total batches processed: {total_processed}")
-    print(f"  Throughput: {throughput:.1f} samples/second")
-    print(f"  Consumer breakdown: {processed_counts}")
-    print(f"{'='*60}")
-    print()
-    print("KEY CONCEPTS:")
-    print("  1. Object Store: Large data (batches) stored in shared memory")
-    print("  2. ObjectRefs: Queue contains references, not copies")
-    print("  3. Zero-copy: Consumers read from object store without copying")
-    print("  4. Parallel execution: Multiple consumers process concurrently")
-    print()
-    print("NEXT: 04_ray_gpu_double_buffer.py to add GPU pipelining to this pattern")
+    print(f"Processed {total_processed} batches across {num_consumers} consumers: {processed_counts}")
 
     # Shutdown Ray
     ray.shutdown()

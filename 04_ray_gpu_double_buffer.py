@@ -5,31 +5,18 @@
 PURPOSE:
 Combine Ray orchestration with GPU double-buffering for multi-GPU scaling.
 
-LEARNING GOALS:
-- Wrap DoubleBufferedPipeline in Ray actors
-- Allocate one GPU per actor with num_gpus=1
-- Use NVTX with actor_id for multi-GPU profiling
-- Scale throughput across multiple GPUs
-- Understand complete pipeline: Producer -> GPU Workers -> Results
+PROFILING:
+Set enable_profiling=True in CONFIG, then run: python 04_ray_gpu_double_buffer.py
+Profiles: /tmp/ray/session_latest/logs/nsight/*.nsys-rep
+View: nsys-ui /tmp/ray/session_latest/logs/nsight/*.nsys-rep
 
-WHAT TO OBSERVE:
-- Run with: python 04_ray_gpu_double_buffer.py
-- Ray dashboard: http://127.0.0.1:8265 (GPU utilization across actors)
-
-PROFILING (Ray-specific approach):
-- Set enable_profiling=True in CONFIG dict below
-- Run: python 04_ray_gpu_double_buffer.py
-- Profiling files auto-generated in: /tmp/ray/session_*/logs/nsight/*.nsys-rep
-- View with: nsys-ui /tmp/ray/session_latest/logs/nsight/*.nsys-rep
-
-IMPORTANT: DO NOT use "nsys profile python 04_ray_gpu_double_buffer.py"
-That only profiles the driver process, not the GPU worker actors!
-Ray profiling uses runtime_env configuration (see actor decorators below).
+*** CRITICAL FOR PROFILING ***
+The graceful_shutdown() method is REQUIRED for nsys profiling to capture GPU activities.
+Without it, actors exit before GPU kernels complete and profiling data is flushed.
+This is THE key lesson for Ray + GPU profiling.
 
 CONFIGURATION:
-Edit CONFIG dict below
-
-NEXT: 05_nway_advanced.py to learn generalized N-way buffering
+Edit CONFIG dict below.
 """
 
 import ray
@@ -38,12 +25,13 @@ import torch
 import torch.cuda.nvtx as nvtx
 import time
 import numpy as np
+import logging
 
 # Configuration
 CONFIG = {
     'batch_size': 8,
     'total_samples': 320,  # Total samples to process
-    'input_shape': (1, 512, 512),  # (C, H, W)
+    'input_shape': (1, 128, 128),  # (C, H, W)
     'num_iterations': 10,  # Matmul loop iterations
     'num_gpu_actors': 2,  # Number of GPU workers (one per GPU)
     'pin_memory': True,
@@ -124,6 +112,8 @@ class DoubleBufferedPipeline:
             self._compute_workload(buffer_idx, current_batch_size)
             self._d2h_transfer(buffer_idx, current_batch_size)
 
+        return buffer_idx
+
     def _h2d_transfer(self, cpu_batch, buffer_idx, current_batch_size):
         with nvtx.range(f"H2D[buf={buffer_idx}]"):
             self.h2d_stream.wait_event(self.compute_done_event[buffer_idx])
@@ -168,6 +158,7 @@ class GPUWorkerActorBase:
     def __init__(self, actor_id, batch_size, input_shape, output_shape, num_iterations, pin_memory):
         self.actor_id = actor_id
         self.batch_size = batch_size
+        self._is_profiling_enabled = False  # Set to True in profiling subclass
 
         # Ray assigns GPU as cuda:0 (physical GPU set via CUDA_VISIBLE_DEVICES)
         import os
@@ -185,6 +176,59 @@ class GPUWorkerActorBase:
         self.processed_count = 0
         print(f"[Worker {actor_id}] Initialized with double-buffered pipeline")
 
+    def graceful_shutdown(self):
+        """
+        Gracefully shutdown the actor, ensuring all GPU work completes and profiling data is captured.
+
+        This method is CRITICAL for nsys profiling to work correctly with Ray actors.
+        Without it, the actor process may terminate before:
+        1. GPU kernels finish executing
+        2. CUDA driver flushes kernel trace data
+        3. nsys captures the GPU timeline
+
+        Returns:
+            Number of batches processed by this actor
+        """
+        logger = logging.getLogger(__name__)
+        logger.info(f"Actor {self.actor_id}: Starting graceful shutdown...")
+
+        # FINAL synchronization - wait for all pending operations to complete
+        if self.processed_count > 0:
+            with nvtx.range(f"Worker{self.actor_id}/final_streaming_sync"):
+                self.pipeline.wait_for_completion()
+
+                # CRITICAL: Additional GPU synchronization for profiling
+                # Ensures all GPU kernels complete before process exit
+                torch.cuda.synchronize(self.pipeline.device.index)
+
+            logger.info(f"Actor {self.actor_id}: GPU synchronization completed")
+
+        # Give nsys profiling time to flush data (important for profile data integrity)
+        import os
+        import json
+        is_profiling = False
+
+        # Check both attribute and environment variable for profiling mode
+        if hasattr(self, '_is_profiling_enabled') and self._is_profiling_enabled:
+            is_profiling = True
+
+        runtime_env_str = os.environ.get('RAY_RUNTIME_ENV', '{}')
+        try:
+            runtime_env = json.loads(runtime_env_str)
+            if 'nsight' in runtime_env:
+                is_profiling = True
+        except:
+            pass
+
+        if is_profiling:
+            logger.info(f"Actor {self.actor_id}: Flushing profiling data...")
+            time.sleep(0.5)  # Allow profiling data to flush
+
+        logger.info(f"Actor {self.actor_id}: Graceful shutdown completed. Total processed: {self.processed_count}")
+
+        # Exit the actor
+        ray.actor.exit_actor()
+
     def process_from_queue(self, queue, num_batches):
         """
         Pull batches from queue and process with double buffering.
@@ -196,15 +240,53 @@ class GPUWorkerActorBase:
         Returns:
             Number of batches processed
         """
+        logger = logging.getLogger(__name__)
         nvtx_prefix = f"Worker{self.actor_id}/"
 
-        for _ in range(num_batches):
+        # Warmup phase: Process initial batches to fill pipeline
+        warmup_batches = 2  # For double buffering (N=2)
+        logger.info(f"Actor {self.actor_id}: Starting warmup ({warmup_batches} batches)...")
+
+        for warmup_idx in range(min(warmup_batches, num_batches)):
+            try:
+                batch_idx, cpu_batch_np = queue.get(timeout=10.0)
+                cpu_batch = torch.from_numpy(cpu_batch_np.astype(np.float32))
+
+                if self.processed_count > 0:
+                    self.pipeline.swap()
+
+                with nvtx.range(f"{nvtx_prefix}Warmup[batch={warmup_idx}]"):
+                    buffer_idx = self.pipeline.process_batch(
+                        cpu_batch, batch_idx, self.batch_size, nvtx_prefix
+                    )
+
+                self.metadata_buffers[buffer_idx] = {
+                    'batch_idx': batch_idx,
+                    'batch_size': self.batch_size,
+                }
+                self.processed_count += 1
+
+            except Exception as e:
+                logger.error(f"Actor {self.actor_id}: Warmup error: {e}")
+                return self.processed_count
+
+        # CRITICAL: Synchronize after warmup to create clear profiling boundary
+        if self.processed_count > 0:
+            with nvtx.range(f"{nvtx_prefix}WarmupSync"):
+                self.pipeline.wait_for_completion()
+                torch.cuda.synchronize(self.pipeline.device.index)
+            logger.info(f"Actor {self.actor_id}: Warmup completed, {self.processed_count} batches processed")
+
+        # Main processing loop
+        remaining_batches = num_batches - self.processed_count
+        for _ in range(remaining_batches):
             try:
                 # Get batch from queue
                 batch_idx, cpu_batch_np = queue.get(timeout=10.0)
 
-                # Convert to torch tensor
-                cpu_batch = torch.from_numpy(cpu_batch_np)
+                # Convert to torch tensor with explicit copy for writability
+                # astype() creates a writable copy, enabling pin_memory() and copy_()
+                cpu_batch = torch.from_numpy(cpu_batch_np.astype(np.float32))
 
                 # Swap buffers (except for first batch)
                 if self.processed_count > 0:
@@ -240,13 +322,10 @@ class GPUWorkerActorBase:
                 self.processed_count += 1
 
             except Exception as e:
-                print(f"[Worker {self.actor_id}] Error: {e}")
+                logger.error(f"[Worker {self.actor_id}] Error: {e}")
                 break
 
-        # Wait for all GPU work to finish
-        self.pipeline.wait_for_completion()
-
-        print(f"[Worker {self.actor_id}] Finished. Total processed: {self.processed_count}")
+        logger.info(f"[Worker {self.actor_id}] Processing completed. Total processed: {self.processed_count}")
         return self.processed_count
 
 
@@ -257,8 +336,10 @@ class GPUWorkerActor(GPUWorkerActorBase):
 
 
 @ray.remote(num_gpus=1, runtime_env={"nsight": {
-    "t": "cuda,nvtx",
+    "t": "cuda,cudnn,cublas,nvtx,osrt",
+    "cuda-graph-trace": "node",
     "cuda-memory-usage": "true",
+    "stop-on-exit": "true",
 }})
 class GPUWorkerActorWithProfiling(GPUWorkerActorBase):
     """
@@ -268,10 +349,14 @@ class GPUWorkerActorWithProfiling(GPUWorkerActorBase):
     Profiling files are generated in: /tmp/ray/session_*/logs/nsight/*.nsys-rep
 
     Runtime environment configuration:
-    - "t": "cuda,nvtx" - Trace CUDA kernels and NVTX annotations
+    - "t": "cuda,cudnn,cublas,nvtx,osrt" - Trace CUDA, cuDNN, cuBLAS, NVTX, and OS runtime
+    - "cuda-graph-trace": "node" - Enable CUDA graph tracing
     - "cuda-memory-usage": "true" - Track memory allocations
+    - "stop-on-exit": "true" - Properly finalize profile on actor exit (CRITICAL)
     """
-    pass
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._is_profiling_enabled = True  # Enable profiling flush in graceful_shutdown()
 
 
 @ray.remote
@@ -309,6 +394,13 @@ def ray_gpu_pipeline(config):
     - N GPU Workers: Each with exclusive GPU and double-buffered pipeline
     - Ray Queue: Distributes work across workers
     """
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+
     batch_size = config['batch_size']
     total_samples = config['total_samples']
     input_shape = config['input_shape']
@@ -368,10 +460,6 @@ def ray_gpu_pipeline(config):
 
     profiling_status = "WITH profiling" if enable_profiling else "WITHOUT profiling"
     print(f"Created {num_gpu_actors} GPU worker actors {profiling_status}")
-    print()
-
-    start_time = time.time()
-
     # Start producer
     producer_task = producer.produce.remote(queue, total_samples)
 
@@ -387,35 +475,24 @@ def ray_gpu_pipeline(config):
     processed_counts = ray.get(worker_tasks)
     total_processed = sum(processed_counts)
 
-    end_time = time.time()
-    elapsed = end_time - start_time
-    throughput = total_processed * batch_size / elapsed
+    # Gracefully shutdown workers to ensure profiling data is captured
+    logger.info("Initiating graceful shutdown of all workers...")
+    shutdown_futures = [worker.graceful_shutdown.remote() for worker in workers]
 
-    print(f"\n{'='*60}")
-    print("Results:")
-    print(f"  Total time: {elapsed:.3f} seconds")
-    print(f"  Total batches processed: {total_processed}/{total_produced}")
-    print(f"  Throughput: {throughput:.1f} samples/second")
-    print(f"  Worker breakdown: {processed_counts}")
-    print(f"{'='*60}")
-    print()
-    print("KEY CONCEPTS:")
-    print("  1. Ray allocates one GPU per actor (num_gpus=1)")
-    print("  2. Each actor runs independent double-buffered pipeline")
-    print("  3. Queue distributes work across GPUs automatically")
-    print("  4. NVTX annotations include actor_id for multi-GPU profiling")
-    print("  5. Throughput scales with number of GPUs")
-    print()
-    print("RAY PROFILING APPROACH:")
-    print("  - Ray uses runtime_env to wrap worker processes with nsys")
-    print("  - Set enable_profiling=True in CONFIG to enable")
-    print("  - Profiling files appear in /tmp/ray/session_*/logs/nsight/")
-    print("  - View with: nsys-ui /tmp/ray/session_latest/logs/nsight/*.nsys-rep")
-    print("  - Filter by 'Worker0/', 'Worker1/' to see per-GPU pipeline behavior")
-    if enable_profiling:
-        print()
-        print(f"  ✓ Profiling was ENABLED for this run")
-        print(f"  ✓ Check: /tmp/ray/session_latest/logs/nsight/")
+    # Wait for all workers to complete shutdown (with timeout)
+    # Note: Actors will exit via ray.actor.exit_actor(), so we expect RayActorError
+    for i, future in enumerate(shutdown_futures):
+        try:
+            ray.get(future, timeout=30.0)
+        except ray.exceptions.RayActorError as e:
+            # Expected - actor exited gracefully
+            logger.info(f"Worker {i}: Exited gracefully")
+        except Exception as e:
+            logger.warning(f"Worker {i}: Shutdown error: {e}")
+
+    logger.info("All workers shut down gracefully")
+
+    print(f"Processed {total_processed}/{total_produced} batches across {num_gpu_actors} workers: {processed_counts}")
 
     ray.shutdown()
 

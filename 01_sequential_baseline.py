@@ -5,35 +5,21 @@
 PURPOSE:
 Establish baseline performance and demonstrate GPU idle time problem.
 
-LEARNING GOALS:
-- Understand H2D, Compute, D2H pipeline stages
-- Measure GPU idle time during data transfers
-- Learn basic NVTX profiling annotations
-
-WHAT TO OBSERVE:
-- Run with: python 01_sequential_baseline.py
-- Profile with: nsys profile -o baseline.nsys-rep --trace=cuda,nvtx python 01_sequential_baseline.py
-- In nsys timeline: Notice gaps between compute kernels (GPU idle during transfers)
+PROFILING:
+nsys profile -o baseline.nsys-rep --trace=cuda,nvtx python 01_sequential_baseline.py
 
 CONFIGURATION:
-Edit CONFIG dict below to adjust:
-- batch_size: Number of samples per batch (affects I/O time)
-- num_batches: Total batches to process
-- input_shape: Tensor dimensions (C, H, W)
-- num_iterations: Matmul loop count (affects compute time)
-
-NEXT: 02_double_buffering.py to eliminate idle time
+Edit CONFIG dict below.
 """
 
 import torch
 import torch.cuda.nvtx as nvtx
-import time
 
 # Configuration
 CONFIG = {
     'batch_size': 8,
     'num_batches': 40,
-    'input_shape': (1, 512, 512),  # (C, H, W)
+    'input_shape': (1, 128, 128),  # (C, H, W)
     'num_iterations': 10,  # Controls compute time (~5-10ms per iteration on V100)
     'gpu_id': 0,
 }
@@ -109,9 +95,6 @@ def sequential_pipeline(config):
         cpu_output.copy_(gpu_output)
     torch.cuda.synchronize()
 
-    print("Starting sequential processing...")
-    start_time = time.time()
-
     with nvtx.range("Sequential Processing"):
         for batch_idx in range(num_batches):
             with nvtx.range(f"Batch {batch_idx}"):
@@ -130,19 +113,7 @@ def sequential_pipeline(config):
     # Wait for all GPU work to complete
     torch.cuda.synchronize()
 
-    end_time = time.time()
-    elapsed = end_time - start_time
-    throughput = num_batches * batch_size / elapsed
-
-    print(f"\nResults:")
-    print(f"  Total time: {elapsed:.3f} seconds")
-    print(f"  Throughput: {throughput:.1f} samples/second")
-    print(f"  Time per batch: {elapsed/num_batches*1000:.2f} ms")
-    print()
-    print("OBSERVATION: In nsys timeline, you'll see gaps between compute kernels.")
-    print("These gaps are when the GPU is IDLE during H2D and D2H transfers.")
-    print()
-    print("NEXT: Run 02_double_buffering.py to see how we can eliminate this idle time")
+    print(f"Processed {num_batches} batches")
 
 
 if __name__ == '__main__':
