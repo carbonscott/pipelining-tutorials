@@ -69,19 +69,21 @@ class DoubleBufferedPipeline:
     - Buffer 1: Compute for batch N, D2H transfer for batch N
     """
 
-    def __init__(self, batch_size, input_shape, num_iterations, gpu_id=0, pin_memory=True):
+    def __init__(self, batch_size, input_shape, output_shape, num_iterations, gpu_id=0, pin_memory=True):
         """
         Initialize double-buffered pipeline.
 
         Args:
             batch_size: Batch size for processing
             input_shape: Input tensor shape (C, H, W) without batch dimension
+            output_shape: Output tensor shape (C, H, W) without batch dimension
             num_iterations: Matmul loop iterations (controls compute time)
             gpu_id: GPU device ID
             pin_memory: Use pinned CPU memory for async transfers
         """
         self.batch_size = batch_size
         self.input_shape = input_shape
+        self.output_shape = output_shape
         self.gpu_id = gpu_id
         self.device = torch.device(f'cuda:{gpu_id}')
 
@@ -98,10 +100,10 @@ class DoubleBufferedPipeline:
             torch.empty(batch_size, *input_shape, device=self.device) for _ in range(2)
         ]
         self.gpu_output_buffers = [
-            torch.empty(batch_size, *input_shape, device=self.device) for _ in range(2)
+            torch.empty(batch_size, *output_shape, device=self.device) for _ in range(2)
         ]
         self.cpu_output_buffers = [
-            torch.empty(batch_size, *input_shape, pin_memory=pin_memory) for _ in range(2)
+            torch.empty(batch_size, *output_shape, pin_memory=pin_memory) for _ in range(2)
         ]
 
         # Create 6 CUDA events (3 per buffer: h2d_done, compute_done, d2h_done)
@@ -109,11 +111,10 @@ class DoubleBufferedPipeline:
         self.compute_done_event = [torch.cuda.Event() for _ in range(2)]
         self.d2h_done_event = [torch.cuda.Event() for _ in range(2)]
 
-        # Prime events to prevent deadlock on first batch
-        for i in range(2):
-            self.h2d_done_event[i].record(torch.cuda.current_stream())
-            self.compute_done_event[i].record(torch.cuda.current_stream())
-            self.d2h_done_event[i].record(torch.cuda.current_stream())
+        # Prime all events so wait_event() never deadlocks on first use
+        for events in [self.h2d_done_event, self.compute_done_event, self.d2h_done_event]:
+            for ev in events:
+                ev.record()  # Record on default stream makes them signaled immediately
 
         # Metadata tracking (matches number of buffers)
         # Stores information about which batch is in which buffer
@@ -167,7 +168,7 @@ class DoubleBufferedPipeline:
                 )
 
             # Record completion
-            self.h2d_done_event[buffer_idx].record(self.h2d_stream)
+            self.h2d_stream.record_event(self.h2d_done_event[buffer_idx])
 
     def _compute_workload(self, buffer_idx, current_batch_size):
         """GPU compute workload"""
@@ -181,7 +182,7 @@ class DoubleBufferedPipeline:
                 self.gpu_output_buffers[buffer_idx][:current_batch_size] = output_slice
 
             # Record completion
-            self.compute_done_event[buffer_idx].record(self.compute_stream)
+            self.compute_stream.record_event(self.compute_done_event[buffer_idx])
 
     def _d2h_transfer(self, buffer_idx, current_batch_size):
         """Device to Host transfer"""
@@ -195,7 +196,7 @@ class DoubleBufferedPipeline:
                 )
 
             # Record completion
-            self.d2h_done_event[buffer_idx].record(self.d2h_stream)
+            self.d2h_stream.record_event(self.d2h_done_event[buffer_idx])
 
     def wait_for_completion(self):
         """Wait for all pipeline stages to complete"""
@@ -213,8 +214,12 @@ def double_buffered_pipeline(config):
     gpu_id = config['gpu_id']
     pin_memory = config['pin_memory']
 
+    # For matmul workload, output shape = input shape
+    # (In production, this would be determined from model output)
+    output_shape = input_shape
+
     # Create pipeline
-    pipeline = DoubleBufferedPipeline(batch_size, input_shape, num_iterations, gpu_id, pin_memory)
+    pipeline = DoubleBufferedPipeline(batch_size, input_shape, output_shape, num_iterations, gpu_id, pin_memory)
 
     # Create input data
     cpu_input = torch.randn(batch_size, *input_shape, pin_memory=pin_memory)

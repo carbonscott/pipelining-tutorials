@@ -76,9 +76,10 @@ class DoubleBufferedPipeline:
     Inlined here for self-contained GitHub gist.
     """
 
-    def __init__(self, batch_size, input_shape, num_iterations, gpu_id=0, pin_memory=True):
+    def __init__(self, batch_size, input_shape, output_shape, num_iterations, gpu_id=0, pin_memory=True):
         self.batch_size = batch_size
         self.input_shape = input_shape
+        self.output_shape = output_shape
         self.gpu_id = gpu_id
         self.device = torch.device(f'cuda:{gpu_id}')
 
@@ -94,10 +95,10 @@ class DoubleBufferedPipeline:
             torch.empty(batch_size, *input_shape, device=self.device) for _ in range(2)
         ]
         self.gpu_output_buffers = [
-            torch.empty(batch_size, *input_shape, device=self.device) for _ in range(2)
+            torch.empty(batch_size, *output_shape, device=self.device) for _ in range(2)
         ]
         self.cpu_output_buffers = [
-            torch.empty(batch_size, *input_shape, pin_memory=pin_memory) for _ in range(2)
+            torch.empty(batch_size, *output_shape, pin_memory=pin_memory) for _ in range(2)
         ]
 
         # 6 events
@@ -105,11 +106,10 @@ class DoubleBufferedPipeline:
         self.compute_done_event = [torch.cuda.Event() for _ in range(2)]
         self.d2h_done_event = [torch.cuda.Event() for _ in range(2)]
 
-        # Prime events
-        for i in range(2):
-            self.h2d_done_event[i].record(torch.cuda.current_stream())
-            self.compute_done_event[i].record(torch.cuda.current_stream())
-            self.d2h_done_event[i].record(torch.cuda.current_stream())
+        # Prime all events so wait_event() never deadlocks on first use
+        for events in [self.h2d_done_event, self.compute_done_event, self.d2h_done_event]:
+            for ev in events:
+                ev.record()  # Record on default stream makes them signaled immediately
 
         self.current_idx = 0
 
@@ -131,7 +131,7 @@ class DoubleBufferedPipeline:
                 self.gpu_input_buffers[buffer_idx][:current_batch_size].copy_(
                     cpu_batch[:current_batch_size], non_blocking=True
                 )
-            self.h2d_done_event[buffer_idx].record(self.h2d_stream)
+            self.h2d_stream.record_event(self.h2d_done_event[buffer_idx])
 
     def _compute_workload(self, buffer_idx, current_batch_size):
         with nvtx.range(f"Compute[buf={buffer_idx}]"):
@@ -140,7 +140,7 @@ class DoubleBufferedPipeline:
                 input_slice = self.gpu_input_buffers[buffer_idx][:current_batch_size]
                 output_slice = self.compute(input_slice)
                 self.gpu_output_buffers[buffer_idx][:current_batch_size] = output_slice
-            self.compute_done_event[buffer_idx].record(self.compute_stream)
+            self.compute_stream.record_event(self.compute_done_event[buffer_idx])
 
     def _d2h_transfer(self, buffer_idx, current_batch_size):
         with nvtx.range(f"D2H[buf={buffer_idx}]"):
@@ -149,7 +149,7 @@ class DoubleBufferedPipeline:
                 self.cpu_output_buffers[buffer_idx][:current_batch_size].copy_(
                     self.gpu_output_buffers[buffer_idx][:current_batch_size], non_blocking=True
                 )
-            self.d2h_done_event[buffer_idx].record(self.d2h_stream)
+            self.d2h_stream.record_event(self.d2h_done_event[buffer_idx])
 
     def wait_for_completion(self):
         self.h2d_stream.synchronize()
@@ -165,7 +165,7 @@ class GPUWorkerActorBase:
     CUDA_VISIBLE_DEVICES is automatically set by Ray.
     """
 
-    def __init__(self, actor_id, batch_size, input_shape, num_iterations, pin_memory):
+    def __init__(self, actor_id, batch_size, input_shape, output_shape, num_iterations, pin_memory):
         self.actor_id = actor_id
         self.batch_size = batch_size
 
@@ -176,7 +176,7 @@ class GPUWorkerActorBase:
 
         # Initialize double-buffered pipeline
         self.pipeline = DoubleBufferedPipeline(
-            batch_size, input_shape, num_iterations, gpu_id=0, pin_memory=pin_memory
+            batch_size, input_shape, output_shape, num_iterations, gpu_id=0, pin_memory=pin_memory
         )
 
         # Metadata tracking (matches pipeline's num_buffers=2)
@@ -347,6 +347,10 @@ def ray_gpu_pipeline(config):
 
     num_batches = total_samples // batch_size
 
+    # For matmul workload, output shape = input shape
+    # (In production, this would be determined from model output)
+    output_shape = input_shape
+
     # Create Ray Queue
     queue = Queue(maxsize=queue_size)
 
@@ -358,7 +362,7 @@ def ray_gpu_pipeline(config):
 
     # Create GPU worker actors
     workers = [
-        ActorClass.remote(i, batch_size, input_shape, num_iterations, pin_memory)
+        ActorClass.remote(i, batch_size, input_shape, output_shape, num_iterations, pin_memory)
         for i in range(num_gpu_actors)
     ]
 

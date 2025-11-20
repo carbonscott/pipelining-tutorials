@@ -89,10 +89,11 @@ class NWayBufferedPipeline:
     Inlined for self-contained GitHub gist.
     """
 
-    def __init__(self, batch_size, input_shape, num_iterations, num_buffers=2,
+    def __init__(self, batch_size, input_shape, output_shape, num_iterations, num_buffers=2,
                  gpu_id=0, pin_memory=True):
         self.batch_size = batch_size
         self.input_shape = input_shape
+        self.output_shape = output_shape
         self.num_buffers = num_buffers
         self.gpu_id = gpu_id
         self.device = torch.device(f'cuda:{gpu_id}')
@@ -108,11 +109,11 @@ class NWayBufferedPipeline:
             for _ in range(num_buffers)
         ]
         self.gpu_output_buffers = [
-            torch.empty(batch_size, *input_shape, device=self.device)
+            torch.empty(batch_size, *output_shape, device=self.device)
             for _ in range(num_buffers)
         ]
         self.cpu_output_buffers = [
-            torch.empty(batch_size, *input_shape, pin_memory=pin_memory)
+            torch.empty(batch_size, *output_shape, pin_memory=pin_memory)
             for _ in range(num_buffers)
         ]
 
@@ -120,10 +121,10 @@ class NWayBufferedPipeline:
         self.compute_done_event = [torch.cuda.Event() for _ in range(num_buffers)]
         self.d2h_done_event = [torch.cuda.Event() for _ in range(num_buffers)]
 
-        for i in range(num_buffers):
-            self.h2d_done_event[i].record(torch.cuda.current_stream())
-            self.compute_done_event[i].record(torch.cuda.current_stream())
-            self.d2h_done_event[i].record(torch.cuda.current_stream())
+        # Prime all events so wait_event() never deadlocks on first use
+        for events in [self.h2d_done_event, self.compute_done_event, self.d2h_done_event]:
+            for ev in events:
+                ev.record()  # Record on default stream makes them signaled immediately
 
         self.current_idx = 0
 
@@ -145,7 +146,7 @@ class NWayBufferedPipeline:
                 self.gpu_input_buffers[buffer_idx][:current_batch_size].copy_(
                     cpu_batch[:current_batch_size], non_blocking=True
                 )
-            self.h2d_done_event[buffer_idx].record(self.h2d_stream)
+            self.h2d_stream.record_event(self.h2d_done_event[buffer_idx])
 
     def _compute_workload(self, buffer_idx, current_batch_size):
         with nvtx.range(f"Compute[buf={buffer_idx}]"):
@@ -154,7 +155,7 @@ class NWayBufferedPipeline:
                 input_slice = self.gpu_input_buffers[buffer_idx][:current_batch_size]
                 output_slice = self.compute(input_slice)
                 self.gpu_output_buffers[buffer_idx][:current_batch_size] = output_slice
-            self.compute_done_event[buffer_idx].record(self.compute_stream)
+            self.compute_stream.record_event(self.compute_done_event[buffer_idx])
 
     def _d2h_transfer(self, buffer_idx, current_batch_size):
         with nvtx.range(f"D2H[buf={buffer_idx}]"):
@@ -163,7 +164,7 @@ class NWayBufferedPipeline:
                 self.cpu_output_buffers[buffer_idx][:current_batch_size].copy_(
                     self.gpu_output_buffers[buffer_idx][:current_batch_size], non_blocking=True
                 )
-            self.d2h_done_event[buffer_idx].record(self.d2h_stream)
+            self.d2h_stream.record_event(self.d2h_done_event[buffer_idx])
 
     def wait_for_completion(self):
         self.h2d_stream.synchronize()
@@ -178,7 +179,7 @@ class NWayGPUWorkerActorBase:
     Production-ready: Supports any N >= 2.
     """
 
-    def __init__(self, actor_id, batch_size, input_shape, num_iterations,
+    def __init__(self, actor_id, batch_size, input_shape, output_shape, num_iterations,
                  num_buffers, pin_memory):
         self.actor_id = actor_id
         self.batch_size = batch_size
@@ -191,7 +192,7 @@ class NWayGPUWorkerActorBase:
 
         # Initialize N-way buffered pipeline
         self.pipeline = NWayBufferedPipeline(
-            batch_size, input_shape, num_iterations, num_buffers,
+            batch_size, input_shape, output_shape, num_iterations, num_buffers,
             gpu_id=0, pin_memory=pin_memory
         )
 
@@ -403,6 +404,10 @@ def ray_nway_pipeline(config):
 
     num_batches = total_samples // batch_size
 
+    # For matmul workload, output shape = input shape
+    # (In production, this would be determined from model output)
+    output_shape = input_shape
+
     # Create Ray Queue
     queue = Queue(maxsize=queue_size)
 
@@ -415,7 +420,7 @@ def ray_nway_pipeline(config):
     # Create N-way GPU worker actors
     workers = [
         ActorClass.remote(
-            i, batch_size, input_shape, num_iterations, num_buffers_per_actor, pin_memory
+            i, batch_size, input_shape, output_shape, num_iterations, num_buffers_per_actor, pin_memory
         )
         for i in range(num_gpu_actors)
     ]
